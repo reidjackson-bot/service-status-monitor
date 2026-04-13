@@ -2,14 +2,34 @@
 // - Tracks previous state per endpoint
 // - Only fires alerts on transitions (up→down, down→up, up→degraded, etc.)
 // - Sends Slack incoming webhook messages
+// - Falls back to email via Gmail if Slack fails
 // - Buffers: requires 2 consecutive failures before alerting down (avoids flapping)
 
+import nodemailer from "nodemailer";
+
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
+const GMAIL_USER = process.env.GMAIL_USER;
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
 const CONFIRM_COUNT = 2; // consecutive checks before alerting a transition
 
 // In-memory state
 const previousStatus = new Map(); // endpointId → { status, count }
 const incidentLog = []; // last 100 incidents
+
+// Gmail transporter (lazy init)
+let mailTransporter = null;
+function getMailTransporter() {
+  if (!mailTransporter && GMAIL_USER && GMAIL_APP_PASSWORD) {
+    mailTransporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: GMAIL_USER,
+        pass: GMAIL_APP_PASSWORD,
+      },
+    });
+  }
+  return mailTransporter;
+}
 
 function getStatusEmoji(status) {
   switch (status) {
@@ -56,6 +76,34 @@ function formatSlackMessage(transition) {
   return { blocks };
 }
 
+function formatEmailSubject(transition) {
+  const emoji = getStatusEmoji(transition.newStatus);
+  const direction = transition.newStatus === "up" ? "recovered" : transition.newStatus === "down" ? "DOWN" : "DEGRADED";
+  return `${emoji} ${transition.serviceName} — ${direction}`;
+}
+
+function formatEmailBody(transition) {
+  const direction = transition.newStatus === "up" ? "recovered" : transition.newStatus === "down" ? "went down" : "is degraded";
+  const duration = transition.downSince
+    ? ` (was down for ${formatDuration(transition.downSince)})`
+    : "";
+
+  const details = [
+    `Service: ${transition.serviceName}`,
+    `Endpoint: ${transition.endpointLabel}`,
+    `Status: ${transition.newStatus.toUpperCase()}${duration}`,
+    `Host: ${transition.host}`,
+    transition.httpStatus ? `HTTP Status: ${transition.httpStatus}` : null,
+    transition.latency != null ? `Latency: ${transition.latency}ms` : null,
+    transition.error ? `Error: ${transition.error}` : null,
+    `Time: ${transition.timestamp}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return `${transition.serviceName} — ${transition.endpointLabel} ${direction}${duration}\n\n${details}`;
+}
+
 function formatDuration(since) {
   const ms = Date.now() - new Date(since).getTime();
   const mins = Math.floor(ms / 60000);
@@ -67,9 +115,8 @@ function formatDuration(since) {
 
 async function sendSlackAlert(payload) {
   if (!SLACK_WEBHOOK_URL) {
-    console.log("[alerts] No SLACK_WEBHOOK_URL configured, skipping alert");
-    console.log("[alerts] Would have sent:", JSON.stringify(payload, null, 2));
-    return;
+    console.log("[alerts] No SLACK_WEBHOOK_URL configured, skipping Slack");
+    return false;
   }
 
   try {
@@ -81,11 +128,49 @@ async function sendSlackAlert(payload) {
 
     if (!res.ok) {
       console.error(`[alerts] Slack webhook failed: ${res.status} ${res.statusText}`);
-    } else {
-      console.log("[alerts] Slack alert sent successfully");
+      return false;
     }
+
+    console.log("[alerts] Slack alert sent successfully");
+    return true;
   } catch (err) {
     console.error("[alerts] Slack webhook error:", err.message);
+    return false;
+  }
+}
+
+async function sendEmailAlert(transition) {
+  const transporter = getMailTransporter();
+  if (!transporter) {
+    console.log("[alerts] No Gmail credentials configured, skipping email");
+    return false;
+  }
+
+  try {
+    await transporter.sendMail({
+      from: `Service Monitor <${GMAIL_USER}>`,
+      to: GMAIL_USER,
+      subject: formatEmailSubject(transition),
+      text: formatEmailBody(transition),
+    });
+
+    console.log("[alerts] Email alert sent successfully");
+    return true;
+  } catch (err) {
+    console.error("[alerts] Email alert error:", err.message);
+    return false;
+  }
+}
+
+async function sendAlert(transition) {
+  // Try Slack first
+  const slackPayload = formatSlackMessage(transition);
+  const slackOk = await sendSlackAlert(slackPayload);
+
+  // If Slack failed, fall back to email
+  if (!slackOk) {
+    console.log("[alerts] Slack failed, falling back to email");
+    await sendEmailAlert(transition);
   }
 }
 
@@ -107,26 +192,20 @@ export async function processResults(serviceResults) {
       if (prev.status === current) {
         // Same status — reset count
         prev.count = Math.min(prev.count + 1, 100);
+        prev.transitionCount = 0;
+        prev.transitionTo = null;
         continue;
       }
 
       // Status changed — increment transition count
-      if (!prev.transitionCount) {
+      if (!prev.transitionCount || prev.transitionTo !== current) {
         prev.transitionCount = 1;
         prev.transitionTo = current;
         prev.transitionStarted = ep.checkedAt;
         continue; // Wait for confirmation
       }
 
-      if (prev.transitionTo === current) {
-        prev.transitionCount++;
-      } else {
-        // Changed to yet another status — reset
-        prev.transitionCount = 1;
-        prev.transitionTo = current;
-        prev.transitionStarted = ep.checkedAt;
-        continue;
-      }
+      prev.transitionCount++;
 
       if (prev.transitionCount >= CONFIRM_COUNT) {
         // Confirmed transition
@@ -159,9 +238,8 @@ export async function processResults(serviceResults) {
           transitionTo: null,
         });
 
-        // Send Slack alert
-        const payload = formatSlackMessage(transition);
-        await sendSlackAlert(payload);
+        // Send alert (Slack first, email fallback)
+        await sendAlert(transition);
       }
     }
   }
