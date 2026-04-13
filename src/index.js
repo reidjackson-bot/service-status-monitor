@@ -147,8 +147,8 @@ app.listen(PORT, () => {
     `[monitor] Slack alerts: ${process.env.SLACK_WEBHOOK_URL ? "enabled" : "NOT configured (set SLACK_WEBHOOK_URL)"}`
   );
 
-  // Run immediately on startup
-  runChecks();
+  // Run first check async — don't block the server from responding to health checks
+  setTimeout(() => runChecks(), 2000);
 
   // Schedule recurring checks
   cron.schedule(CHECK_INTERVAL, runChecks, {
